@@ -89,12 +89,7 @@ Watch the full walkthrough on YouTube where I break down the API integrations, b
 
 ### 1. **Set Up Next.js Project**
 
-```bash
-npx create-next-app@latest am-i-spam --typescript --tailwind --app
-cd am-i-spam
-npm install papaparse react-hot-toast lucide-react axios
-npm install --save-dev @types/papaparse
-```
+Start by creating a new Next.js 15 project with TypeScript and Tailwind CSS. The CLI wizard walks you through the setup in under a minute. Once the base project is ready, install the additional packages you'll need: PapaParse for CSV processing, React Hot Toast for notifications, Lucide React for icons, and Axios for API calls.
 
 **Why Next.js 15?**
 - App Router for modern routing
@@ -117,616 +112,79 @@ npm install --save-dev @types/papaparse
 - Free 250 requests/month
 - Basic validation and carrier lookup
 
-**Environment Setup:**
-Create `.env.local`:
-```env
-IPQUALITYSCORE_API_KEY=your_ipqs_api_key_here
-NUMVERIFY_API_KEY=your_numverify_api_key_here
-```
+Create a `.env.local` file in your project root to store these API keys securely. This file is automatically ignored by Git, so your credentials never get committed to your repository. Next.js loads these environment variables server-side, keeping them hidden from browser code.
 
 ---
 
 ### 3. **Define TypeScript Types**
 
-Create `src/types/index.ts`:
+Before writing any business logic, define the data structures you'll be working with. Create a types file that describes what a reputation check result looks like - including the phone number, validation status, carrier info, location data, and all the reputation metrics like spam score and risk level.
 
-```typescript
-export interface ReputationCheck {
-  phoneNumber: string;
-  timestamp: Date;
-  isValid: boolean;
-  carrier?: string;
-  lineType?: string;
-  location?: {
-    city?: string;
-    state?: string;
-    country?: string;
-  };
-  reputation: {
-    spamScore?: number;
-    spamLikely: boolean;
-    scamLikely: boolean;
-    riskLevel: 'low' | 'medium' | 'high' | 'unknown';
-    flaggedByCarriers: string[];
-    attestationLevel?: 'A' | 'B' | 'C' | 'unknown';
-  };
-  cnam?: {
-    registered: boolean | null;
-    displayName?: string;
-  };
-  disconnected?: boolean;
-  reassigned?: boolean;
-  healthScore?: number;
-  errors?: string[];
-}
-```
-
-**Why TypeScript?** Catches bugs at compile time, especially when dealing with complex API responses.
+This upfront work pays off immediately: your IDE provides autocomplete, catches typos, and warns you when you're accessing properties that don't exist. When dealing with complex API responses from multiple providers, TypeScript prevents countless runtime bugs.
 
 ---
 
 ### 4. **Build the API Route for Single Number Validation**
 
-Create `src/app/api/validate/route.ts`:
+Create a server-side API route that handles phone validation requests. This route receives a phone number from the frontend, calls the IPQualityScore API with your secret key, and transforms the raw response into your standardized format. The API key never leaves the server, so it can't be stolen from browser dev tools.
 
-```typescript
-import { NextRequest, NextResponse } from 'next/server';
-import { ReputationCheck } from '@/types';
-
-async function checkIPQualityScore(phoneNumber: string) {
-  const apiKey = process.env.IPQUALITYSCORE_API_KEY;
-
-  if (!apiKey) return null;
-
-  const response = await fetch(
-    `https://ipqualityscore.com/api/json/phone/${apiKey}/${encodeURIComponent(phoneNumber)}`,
-    { cache: 'no-store' }
-  );
-
-  if (response.ok) {
-    return await response.json();
-  }
-
-  return null;
-}
-
-export async function POST(request: NextRequest) {
-  const { phoneNumber } = await request.json();
-
-  if (!phoneNumber) {
-    return NextResponse.json(
-      { error: 'Phone number is required' },
-      { status: 400 }
-    );
-  }
-
-  const ipqsData = await checkIPQualityScore(phoneNumber);
-
-  if (ipqsData) {
-    const result: ReputationCheck = {
-      phoneNumber,
-      timestamp: new Date(),
-      isValid: ipqsData.valid || false,
-      carrier: ipqsData.carrier,
-      lineType: ipqsData.line_type,
-      location: {
-        city: ipqsData.city,
-        state: ipqsData.region,
-        country: ipqsData.country,
-      },
-      reputation: {
-        spamScore: ipqsData.fraud_score || 0,
-        spamLikely: ipqsData.recent_abuse || false,
-        scamLikely: ipqsData.fraud_score > 75,
-        riskLevel: ipqsData.fraud_score > 75 ? 'high'
-                  : ipqsData.fraud_score > 50 ? 'medium'
-                  : 'low',
-        flaggedByCarriers: [],
-        attestationLevel: 'unknown',
-      },
-      disconnected: !ipqsData.active,
-    };
-
-    return NextResponse.json(result);
-  }
-
-  return NextResponse.json(
-    { error: 'Validation failed' },
-    { status: 500 }
-  );
-}
-```
-
-**Key Points:**
-- API keys stay on server (never exposed to browser)
-- Uses Next.js App Router API routes
-- Returns structured JSON with all reputation data
+The route also handles error cases gracefully - missing phone numbers, API failures, and invalid responses all return appropriate error messages. This gives your frontend predictable responses to work with.
 
 ---
 
 ### 5. **Build Phone Validator Client Library**
 
-Create `src/lib/phone-validator.ts`:
+Create a client-side library that handles all the phone validation logic your components will need. This class formats phone numbers into a consistent E.164 format (adding country codes, stripping formatting characters), then makes the API calls to your server-side routes.
 
-```typescript
-export class PhoneValidator {
-  private static formatPhoneNumber(phone: string): string {
-    const cleaned = phone.replace(/\D/g, '');
-
-    // Handle US numbers: 10 digits → +1XXXXXXXXXX
-    if (cleaned.length === 10) {
-      return `+1${cleaned}`;
-    } else if (cleaned.length === 11 && cleaned.startsWith('1')) {
-      return `+${cleaned}`;
-    }
-
-    return phone;
-  }
-
-  static async validateSingle(phoneNumber: string): Promise<ReputationCheck> {
-    const formatted = this.formatPhoneNumber(phoneNumber);
-
-    const response = await fetch('/api/validate', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ phoneNumber: formatted }),
-    });
-
-    if (!response.ok) {
-      throw new Error('Validation failed');
-    }
-
-    return await response.json();
-  }
-
-  static async validateBulk(phoneNumbers: string[]): Promise<ReputationCheck[]> {
-    const formatted = phoneNumbers.map(phone => this.formatPhoneNumber(phone));
-
-    const response = await fetch('/api/validate/bulk', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ phoneNumbers: formatted }),
-    });
-
-    return await response.json();
-  }
-}
-```
-
-**Why a class?** Encapsulates phone formatting logic and provides clean API for components.
+By encapsulating this logic in a single place, your components stay clean and focused on UI. If you ever need to change how phone numbers are formatted or add caching, you only update one file.
 
 ---
 
 ### 6. **Build Single Number Form Component**
 
-Create `src/components/SingleNumberForm.tsx`:
+Create a simple form component that lets users type in a phone number and submit it for checking. The component manages its own input state, handles form submission, and shows loading feedback while the API call is in progress. Disabled states prevent double-submissions when users get impatient.
 
-```typescript
-'use client';
-
-import { useState } from 'react';
-import { Phone } from 'lucide-react';
-
-interface Props {
-  onSubmit: (phoneNumber: string) => Promise<void>;
-  isLoading: boolean;
-}
-
-export default function SingleNumberForm({ onSubmit, isLoading }: Props) {
-  const [phoneNumber, setPhoneNumber] = useState('');
-
-  const handleSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!phoneNumber.trim()) return;
-    await onSubmit(phoneNumber);
-  };
-
-  return (
-    <form onSubmit={handleSubmit} className="space-y-4">
-      <div>
-        <label className="block text-sm font-medium text-gray-700 mb-2">
-          Phone Number
-        </label>
-        <div className="flex gap-2">
-          <input
-            type="tel"
-            value={phoneNumber}
-            onChange={(e) => setPhoneNumber(e.target.value)}
-            placeholder="(555) 123-4567"
-            className="flex-1 px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
-          />
-          <button
-            type="submit"
-            disabled={isLoading}
-            className="px-6 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2"
-          >
-            <Phone className="h-4 w-4" />
-            {isLoading ? 'Checking...' : 'Check'}
-          </button>
-        </div>
-      </div>
-    </form>
-  );
-}
-```
-
-Clean, simple form with loading states.
+Keep this component focused on input only - it doesn't know anything about results or how they're displayed. That separation makes it reusable and easy to test.
 
 ---
 
 ### 7. **Build CSV Upload Component**
 
-Create `src/components/FileUpload.tsx`:
+Create a drag-and-drop style file upload component for bulk processing. When a user selects a CSV file, PapaParse reads and parses it client-side, extracting all the phone numbers from whatever column structure the file has. Toast notifications give immediate feedback about how many numbers were found.
 
-```typescript
-'use client';
-
-import { useRef } from 'react';
-import Papa from 'papaparse';
-import { Upload } from 'lucide-react';
-import toast from 'react-hot-toast';
-
-interface Props {
-  onNumbersExtracted: (numbers: string[]) => void;
-}
-
-export default function FileUpload({ onNumbersExtracted }: Props) {
-  const fileInputRef = useRef<HTMLInputElement>(null);
-
-  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-
-    Papa.parse(file, {
-      complete: (results) => {
-        const phoneNumbers = results.data
-          .flat()
-          .filter((value): value is string => typeof value === 'string')
-          .map(num => num.trim())
-          .filter(num => num.length > 0);
-
-        if (phoneNumbers.length === 0) {
-          toast.error('No phone numbers found in CSV');
-          return;
-        }
-
-        toast.success(`Found ${phoneNumbers.length} numbers`);
-        onNumbersExtracted(phoneNumbers);
-      },
-      error: () => {
-        toast.error('Failed to parse CSV file');
-      },
-    });
-  };
-
-  return (
-    <div className="border-2 border-dashed border-gray-300 rounded-lg p-8 text-center">
-      <Upload className="h-12 w-12 text-gray-400 mx-auto mb-4" />
-      <p className="text-sm text-gray-600 mb-4">
-        Upload a CSV file with phone numbers
-      </p>
-      <input
-        ref={fileInputRef}
-        type="file"
-        accept=".csv"
-        onChange={handleFileChange}
-        className="hidden"
-      />
-      <button
-        type="button"
-        onClick={() => fileInputRef.current?.click()}
-        className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700"
-      >
-        Choose File
-      </button>
-    </div>
-  );
-}
-```
-
-**PapaParse** does the heavy lifting - parses CSV, extracts phone numbers, handles errors.
+This component handles the messy reality of user-uploaded files - empty rows, mixed data types, different column formats. It extracts what it can and passes clean data upstream.
 
 ---
 
 ### 8. **Build Results Table with Export**
 
-Create `src/components/ResultsTable.tsx`:
+Create a results table component that displays all the reputation data in a scannable format. Color-coded risk badges make it easy to spot problem numbers at a glance - green for low risk, yellow for medium, red for high. The table handles both single results and bulk results gracefully.
 
-```typescript
-'use client';
-
-import { ReputationCheck } from '@/types';
-import { Download } from 'lucide-react';
-
-interface Props {
-  results: ReputationCheck[];
-  onExport: () => void;
-}
-
-export default function ResultsTable({ results, onExport }: Props) {
-  const getRiskBadge = (level: string) => {
-    const styles = {
-      low: 'bg-green-100 text-green-800',
-      medium: 'bg-yellow-100 text-yellow-800',
-      high: 'bg-red-100 text-red-800',
-      unknown: 'bg-gray-100 text-gray-800',
-    };
-
-    return (
-      <span className={`px-2 py-1 rounded-full text-xs font-medium ${styles[level as keyof typeof styles]}`}>
-        {level.toUpperCase()}
-      </span>
-    );
-  };
-
-  return (
-    <div className="space-y-4">
-      <div className="flex justify-between items-center">
-        <h3 className="text-lg font-semibold">Results ({results.length})</h3>
-        <button
-          onClick={onExport}
-          className="flex items-center gap-2 px-4 py-2 bg-green-600 text-white rounded-lg hover:bg-green-700"
-        >
-          <Download className="h-4 w-4" />
-          Export CSV
-        </button>
-      </div>
-
-      <div className="overflow-x-auto">
-        <table className="min-w-full divide-y divide-gray-200">
-          <thead className="bg-gray-50">
-            <tr>
-              <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">
-                Phone Number
-              </th>
-              <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">
-                Risk Level
-              </th>
-              <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">
-                Spam Score
-              </th>
-              <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">
-                Carrier
-              </th>
-              <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">
-                Attestation
-              </th>
-            </tr>
-          </thead>
-          <tbody className="bg-white divide-y divide-gray-200">
-            {results.map((result, idx) => (
-              <tr key={idx}>
-                <td className="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900">
-                  {result.phoneNumber}
-                </td>
-                <td className="px-6 py-4 whitespace-nowrap">
-                  {getRiskBadge(result.reputation.riskLevel)}
-                </td>
-                <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
-                  {result.reputation.spamScore?.toFixed(0) ?? 'N/A'}
-                </td>
-                <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
-                  {result.carrier ?? 'Unknown'}
-                </td>
-                <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
-                  {result.reputation.attestationLevel ?? 'N/A'}
-                </td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
-    </div>
-  );
-}
-```
-
-Clean table with color-coded risk levels.
+Include an export button right in the header so users can download their results instantly. This is often the whole point - getting a report they can share with their team or VoIP provider.
 
 ---
 
 ### 9. **Implement CSV Export**
 
-Create `src/lib/export.ts`:
+Create a utility function that transforms your results array into a downloadable CSV file. Map each result object to a row with all the relevant fields - phone number, risk level, spam score, carrier, attestation level, and location data. Handle missing values gracefully with empty strings or "N/A".
 
-```typescript
-import { ReputationCheck } from '@/types';
-
-export function exportToCSV(results: ReputationCheck[]) {
-  const headers = [
-    'Phone Number',
-    'Risk Level',
-    'Spam Score',
-    'Spam Likely',
-    'Scam Likely',
-    'Carrier',
-    'Line Type',
-    'Attestation',
-    'Disconnected',
-    'City',
-    'State',
-    'Country'
-  ];
-
-  const rows = results.map(r => [
-    r.phoneNumber,
-    r.reputation.riskLevel,
-    r.reputation.spamScore?.toString() ?? '',
-    r.reputation.spamLikely ? 'Yes' : 'No',
-    r.reputation.scamLikely ? 'Yes' : 'No',
-    r.carrier ?? '',
-    r.lineType ?? '',
-    r.reputation.attestationLevel ?? '',
-    r.disconnected ? 'Yes' : 'No',
-    r.location?.city ?? '',
-    r.location?.state ?? '',
-    r.location?.country ?? ''
-  ]);
-
-  const csvContent = [
-    headers.join(','),
-    ...rows.map(row => row.map(cell => `"${cell}"`).join(','))
-  ].join('\n');
-
-  const blob = new Blob([csvContent], { type: 'text/csv' });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = `phone-reputation-${new Date().toISOString().split('T')[0]}.csv`;
-  a.click();
-  URL.revokeObjectURL(url);
-}
-```
-
-Downloads CSV with all reputation data - perfect for sharing with team or VoIP provider.
+The function creates a blob from the CSV content, generates a temporary URL, and triggers a download - all without any server round-trip. The filename includes today's date so users can track when they ran each audit.
 
 ---
 
 ### 10. **Build Main Page with Tabs**
 
-Create `src/app/page.tsx`:
+Wire everything together in your main page component. Use tabs to switch between single-number and bulk-upload modes. Manage the loading state and results array at this level so all child components can share data.
 
-```typescript
-'use client';
-
-import { useState } from 'react';
-import { Toaster } from 'react-hot-toast';
-import toast from 'react-hot-toast';
-import SingleNumberForm from '@/components/SingleNumberForm';
-import FileUpload from '@/components/FileUpload';
-import ResultsTable from '@/components/ResultsTable';
-import { PhoneValidator } from '@/lib/phone-validator';
-import { exportToCSV } from '@/lib/export';
-import { ReputationCheck } from '@/types';
-
-export default function Home() {
-  const [activeTab, setActiveTab] = useState<'single' | 'bulk'>('single');
-  const [results, setResults] = useState<ReputationCheck[]>([]);
-  const [isLoading, setIsLoading] = useState(false);
-
-  const handleSingleCheck = async (phoneNumber: string) => {
-    setIsLoading(true);
-    try {
-      const result = await PhoneValidator.validateSingle(phoneNumber);
-      setResults([result]);
-
-      if (result.reputation.riskLevel === 'high') {
-        toast.error('⚠️ High risk number detected!');
-      } else {
-        toast.success('Number checked successfully');
-      }
-    } catch (error) {
-      toast.error('Failed to check phone number');
-    } finally {
-      setIsLoading(false);
-    }
-  };
-
-  const handleBulkCheck = async (phoneNumbers: string[]) => {
-    setIsLoading(true);
-    setResults([]);
-
-    try {
-      toast.loading(`Checking ${phoneNumbers.length} numbers...`, { id: 'bulk' });
-
-      // Process in batches of 10 to avoid rate limits
-      const batchSize = 10;
-      const allResults: ReputationCheck[] = [];
-
-      for (let i = 0; i < phoneNumbers.length; i += batchSize) {
-        const batch = phoneNumbers.slice(i, i + batchSize);
-        const batchResults = await PhoneValidator.validateBulk(batch);
-        allResults.push(...batchResults);
-        setResults([...allResults]);
-
-        toast.loading(
-          `Processed ${Math.min(i + batchSize, phoneNumbers.length)} of ${phoneNumbers.length}...`,
-          { id: 'bulk' }
-        );
-      }
-
-      toast.success(`Checked ${allResults.length} numbers`, { id: 'bulk' });
-
-      const highRiskCount = allResults.filter(r => r.reputation.riskLevel === 'high').length;
-      if (highRiskCount > 0) {
-        toast.error(`Found ${highRiskCount} high-risk numbers!`);
-      }
-    } catch (error) {
-      toast.error('Failed to check phone numbers', { id: 'bulk' });
-    } finally {
-      setIsLoading(false);
-    }
-  };
-
-  return (
-    <main className="min-h-screen bg-gray-50">
-      <Toaster position="top-right" />
-
-      <div className="max-w-7xl mx-auto px-4 py-8">
-        <h1 className="text-3xl font-bold mb-8">Am I Spam?</h1>
-
-        {/* Tab switcher */}
-        <div className="flex gap-2 mb-6">
-          <button
-            onClick={() => setActiveTab('single')}
-            className={activeTab === 'single' ? 'active' : ''}
-          >
-            Single Number
-          </button>
-          <button
-            onClick={() => setActiveTab('bulk')}
-            className={activeTab === 'bulk' ? 'active' : ''}
-          >
-            Bulk Upload
-          </button>
-        </div>
-
-        {/* Forms */}
-        {activeTab === 'single' ? (
-          <SingleNumberForm onSubmit={handleSingleCheck} isLoading={isLoading} />
-        ) : (
-          <FileUpload onNumbersExtracted={handleBulkCheck} />
-        )}
-
-        {/* Results */}
-        {results.length > 0 && (
-          <ResultsTable results={results} onExport={() => exportToCSV(results)} />
-        )}
-      </div>
-    </main>
-  );
-}
-```
-
-**Real-time progress updates** as bulk checks run - users see exactly what's happening.
+For bulk processing, implement batch logic that processes numbers in groups of 10 to avoid rate limits. Show real-time progress with toast notifications so users know exactly how far along the process is. When complete, highlight any high-risk numbers found.
 
 ---
 
 ### 11. **Deploy to Vercel**
 
-```bash
-# Install Vercel CLI
-npm i -g vercel
+Deploy your app using the Vercel CLI. The first deployment links your local project to Vercel and sets up automatic deployments for future pushes. Add your API keys as environment variables in the Vercel dashboard - these are encrypted and only available server-side.
 
-# Deploy
-vercel
-```
-
-Follow prompts:
-- Link to project
-- Set environment variables (API keys)
-
-**Set Production Environment Variables:**
-In Vercel dashboard → Settings → Environment Variables:
-- `IPQUALITYSCORE_API_KEY` = your_key
-- `NUMVERIFY_API_KEY` = your_key
-
-Deploy to production:
-```bash
-vercel --prod
-```
-
-Live in seconds!
+Once environment variables are set, run the production deploy command. Your app goes live in seconds with automatic SSL, global CDN distribution, and serverless function scaling. Share the URL with your team and start checking numbers.
 
 ---
 
